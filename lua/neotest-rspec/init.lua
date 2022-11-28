@@ -2,6 +2,7 @@ local async = require("neotest.async")
 local lib = require("neotest.lib")
 local logger = require("neotest.logging")
 local utils = require("neotest-rspec.utils")
+local dap = require('dap')
 
 ---@class neotest.Adapter
 ---@field name string
@@ -71,6 +72,73 @@ local function get_rspec_cmd()
   })
 end
 
+dap.listeners.before['event_output']['neotest-rspec'] = function(_, body)
+  print("[dap] output", body.category)
+end
+
+dap.listeners.before['event_exited']['neotest-rspec'] = function(_, info)
+  print("[dap] exited", info.exitCode)
+end
+
+dap.listeners.before['event_terminated']['neotest-rspec'] = function(_, info)
+  print("[dap] terminated", vim.inspect(info))
+end
+
+dap.adapters.ruby = function(callback, config)
+  local handle, pid_or_err
+  local stdout = vim.loop.new_pipe(false)
+  local stderr = vim.loop.new_pipe(false)
+  local opts = {
+    args = vim.tbl_flatten({'-n', '--open', '--port', config.port, '-c', '--', config.command}),
+    detached = false,
+    stdio = {nil, stdout, stderr},
+  }
+
+  handle, pid_or_err = vim.loop.spawn('rdbg', opts, function(code)
+    handle:close()
+    print('rdbg exited with code', code)
+  end)
+
+  assert(handle, pid_or_err)
+
+  stdout:read_start(function(err, chunk)
+    assert(not err, err)
+    if chunk then
+      print(chunk)
+    end
+  end)
+  stderr:read_start(function(err, chunk)
+    assert(not err, err)
+    if chunk then
+      print(chunk)
+    end
+  end)
+
+  vim.defer_fn(function()
+    callback({ type = "server", host = config.server, port = config.port })
+  end, 750)
+end
+
+local dap_args
+local function build_strategy(strategy, command)
+  local configs = {
+    dap = function()
+      return vim.tbl_extend("keep", {
+        type = "ruby",
+        name = "Neotest Debugger",
+        command = command,
+        localfs = true,
+        port = 38698,
+        request = "attach",
+        server = "127.0.0.1",
+      }, dap_args or {})
+    end
+  }
+  if configs[strategy] then
+    return configs[strategy]()
+  end
+end
+
 ---@param args neotest.RunArgs
 ---@return neotest.RunSpec | nil
 function NeotestAdapter.build_spec(args)
@@ -100,7 +168,9 @@ function NeotestAdapter.build_spec(args)
     )
   end
 
+  local current_line = false
   local function run_by_line_number()
+    current_line = true
     table.insert(
       script_args,
       vim.tbl_flatten({
@@ -126,11 +196,14 @@ function NeotestAdapter.build_spec(args)
     script_args,
   })
 
+  local strategy = build_strategy(args.strategy, command)
+
   return {
     command = command,
     context = {
       results_path = results_path,
     },
+    strategy = strategy,
   }
 end
 
@@ -175,6 +248,9 @@ setmetatable(NeotestAdapter, {
       get_rspec_cmd = function()
         return opts.rspec_cmd
       end
+    end
+    if type(opts.dap) == "table" then
+      dap_args = opts.dap
     end
     return NeotestAdapter
   end,
